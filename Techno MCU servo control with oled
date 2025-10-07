@@ -1,0 +1,959 @@
+/*
+ TechnoMCU - Final Advanced Web UI
+ - NodeMCU (ESP8266)
+ - 2 Servos (X/Y) on D5 (GPIO14), D6 (GPIO12)
+ - 1 Relay on D7 (GPIO13) - active LOW
+ - OLED SSD1306 manual I2C on SDA=D2 (GPIO4), SCL=D1 (GPIO5), addr 0x3C
+ - 2 Switches for mode control on D3 (GPIO0), D4 (GPIO2)
+ - Captive AP: SSID = "TechnoMCU_Control", PASS = "raktim52"
+ - Physical buttons for manual control
+ - Sharpy mode with pattern movement
+ - Manual mode for direct servo control
+*/
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <DNSServer.h>
+#include <Servo.h>
+#include <EEPROM.h>
+
+// Pin assignments
+#define SERVO_X_PIN 14
+#define SERVO_Y_PIN 12
+#define RELAY_PIN    13
+#define SDA_PIN       4
+#define SCL_PIN       5
+#define OLED_ADDR   0x3C
+
+#define BTN_A_PIN 0
+#define BTN_B_PIN 2
+#define SWITCH1_PIN 0  // D3 - GPIO0
+#define SWITCH2_PIN 2  // D4 - GPIO2
+
+// WiFi AP
+const char* apSsid = "TechnoMCU_Control";
+const char* apPass = "raktim52";
+IPAddress apIP(192,168,4,1);
+
+// Globals
+Servo sX, sY;
+ESP8266WebServer server(80);
+DNSServer dnsServer;
+
+volatile int servoXpos = 90;
+volatile int servoYpos = 90;
+volatile bool relayState = false;
+
+// Operation Modes
+enum OperationMode { 
+  MODE_MANUAL = 0, 
+  MODE_SHARPY = 1, 
+  MODE_RELAY = 2 
+};
+
+OperationMode operationMode = MODE_MANUAL;
+
+// Display Modes
+enum DisplayMode { 
+  DISPLAY_FULL = 0, 
+  DISPLAY_MANUAL = 1, 
+  DISPLAY_SHARPY = 2, 
+  DISPLAY_RELAY = 3 
+};
+
+DisplayMode displayMode = DISPLAY_FULL;
+
+uint8_t ssd_buf[1024];
+unsigned long lastOledUpdate = 0;
+unsigned long oledInterval = 300;
+
+// Button handling
+unsigned long btnAPressTime = 0;
+unsigned long btnBPressTime = 0;
+bool btnAPressed = false;
+bool btnBPressed = false;
+bool bothButtonsPressed = false;
+unsigned long bothButtonsStartTime = 0;
+
+// Switch handling
+bool switch1State = false;
+bool switch2State = false;
+bool lastSwitch1State = false;
+bool lastSwitch2State = false;
+unsigned long lastSwitchRead = 0;
+#define SWITCH_DEBOUNCE 100
+
+#define EEPROM_SIZE 64
+#define ADDR_MAGIC 0
+#define ADDR_RELAY 1
+#define ADDR_SERVO_X 2
+#define ADDR_SERVO_Y 3
+#define ADDR_MODE 4
+const uint8_t MAGIC = 0xA5;
+
+// Function declarations
+void setOperationMode(OperationMode newMode);
+void updateOLED();
+void applyServos();
+void applyRelay();
+void handleButtons();
+void readSwitches();
+void updateSharpyMode();
+void saveState();
+void loadState();
+bool isCaptivePortal();
+String webpage();
+
+// Minimal I2C for SSD1306
+void i2c_beginPins(){
+  pinMode(SDA_PIN, OUTPUT);
+  pinMode(SCL_PIN, OUTPUT);
+  digitalWrite(SDA_PIN, HIGH);
+  digitalWrite(SCL_PIN, HIGH);
+}
+
+void i2c_start(){
+  digitalWrite(SDA_PIN,HIGH); digitalWrite(SCL_PIN,HIGH);
+  digitalWrite(SDA_PIN,LOW);  digitalWrite(SCL_PIN,LOW);
+}
+
+void i2c_stop(){
+  digitalWrite(SDA_PIN,LOW); digitalWrite(SCL_PIN,HIGH);
+  digitalWrite(SDA_PIN,HIGH);
+}
+
+void i2c_writeByte(uint8_t b){
+  for(uint8_t i=0;i<8;i++){
+    digitalWrite(SDA_PIN,(b & 0x80)?HIGH:LOW);
+    digitalWrite(SCL_PIN,HIGH);
+    delayMicroseconds(2);
+    digitalWrite(SCL_PIN,LOW);
+    b <<= 1;
+  }
+  pinMode(SDA_PIN, INPUT);
+  digitalWrite(SCL_PIN, HIGH);
+  delayMicroseconds(2);
+  digitalWrite(SCL_PIN, LOW);
+  pinMode(SDA_PIN, OUTPUT);
+}
+
+void ssd_cmd(uint8_t c){
+  i2c_start();
+  i2c_writeByte((OLED_ADDR<<1)|0);
+  i2c_writeByte(0x00);
+  i2c_writeByte(c);
+  i2c_stop();
+}
+
+void ssd_data(uint8_t d){
+  i2c_start();
+  i2c_writeByte((OLED_ADDR<<1)|0);
+  i2c_writeByte(0x40);
+  i2c_writeByte(d);
+  i2c_stop();
+}
+
+// SSD1306 Init
+void ssd_init(){
+  i2c_beginPins();
+  delay(50);
+  ssd_cmd(0xAE);
+  ssd_cmd(0xD5); ssd_cmd(0x80);
+  ssd_cmd(0xA8); ssd_cmd(0x3F);
+  ssd_cmd(0xD3); ssd_cmd(0x00);
+  ssd_cmd(0x40);
+  ssd_cmd(0x8D); ssd_cmd(0x14);
+  ssd_cmd(0x20); ssd_cmd(0x00);
+  ssd_cmd(0xA1);
+  ssd_cmd(0xC8);
+  ssd_cmd(0xDA); ssd_cmd(0x12);
+  ssd_cmd(0x81); ssd_cmd(0xCF);
+  ssd_cmd(0xD9); ssd_cmd(0xF1);
+  ssd_cmd(0xDB); ssd_cmd(0x40);
+  ssd_cmd(0xA4);
+  ssd_cmd(0xA6);
+  ssd_cmd(0xAF);
+  memset(ssd_buf,0,sizeof(ssd_buf));
+}
+
+void ssd_displayBuffer(){
+  for(uint8_t p=0;p<8;p++){
+    ssd_cmd(0xB0|p);
+    ssd_cmd(0x00);
+    ssd_cmd(0x10);
+    i2c_start();
+    i2c_writeByte((OLED_ADDR<<1)|0);
+    i2c_writeByte(0x40);
+    for(int c=0;c<128;c++){
+      i2c_writeByte(ssd_buf[p*128 + c]);
+    }
+    i2c_stop();
+  }
+}
+
+void ssd_clearBuffer(){ 
+  memset(ssd_buf,0,sizeof(ssd_buf)); 
+}
+
+// Font 5x7
+const uint8_t font5x7[] = {
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x5F,0x00,0x00,0x00,0x07,0x00,0x07,0x00,
+  0x14,0x7F,0x14,0x7F,0x14,0x24,0x2A,0x7F,0x2A,0x12,0x23,0x13,0x08,0x64,0x62,
+  0x36,0x49,0x55,0x22,0x50,0x00,0x05,0x03,0x00,0x00,0x00,0x1C,0x22,0x41,0x00,
+  0x00,0x41,0x22,0x1C,0x00,0x14,0x08,0x3E,0x08,0x14,0x08,0x08,0x3E,0x08,0x08,
+  0x00,0x50,0x30,0x00,0x00,0x08,0x08,0x08,0x08,0x08,0x00,0x60,0x60,0x00,0x00,
+  0x20,0x10,0x08,0x04,0x02,0x3E,0x51,0x49,0x45,0x3E,0x00,0x42,0x7F,0x40,0x00,
+  0x42,0x61,0x51,0x49,0x46,0x21,0x41,0x45,0x4B,0x31,0x18,0x14,0x12,0x7F,0x10,
+  0x27,0x45,0x45,0x45,0x39,0x3C,0x4A,0x49,0x49,0x30,0x01,0x71,0x09,0x05,0x03,
+  0x36,0x49,0x49,0x49,0x36,0x06,0x49,0x49,0x29,0x1E,0x00,0x36,0x36,0x00,0x00,
+  0x00,0x56,0x36,0x00,0x00,0x08,0x14,0x22,0x41,0x00,0x14,0x14,0x14,0x14,0x14,
+  0x00,0x41,0x22,0x14,0x08,0x02,0x01,0x51,0x09,0x06,0x32,0x49,0x79,0x41,0x3E,
+  0x7E,0x11,0x11,0x11,0x7E,0x7F,0x49,0x49,0x49,0x36,0x3E,0x41,0x41,0x41,0x22,
+  0x7F,0x41,0x41,0x22,0x1C,0x7F,0x49,0x49,0x49,0x41,0x7F,0x09,0x09,0x09,0x01,
+  0x3E,0x41,0x49,0x49,0x7A,0x7F,0x08,0x08,0x08,0x7F,0x00,0x41,0x7F,0x41,0x00,
+  0x20,0x40,0x41,0x3F,0x01,0x7F,0x08,0x14,0x22,0x41,0x7F,0x40,0x40,0x40,0x40,
+  0x7F,0x02,0x0C,0x02,0x7F,0x7F,0x04,0x08,0x10,0x7F,0x3E,0x41,0x41,0x41,0x3E,
+  0x7F,0x09,0x09,0x09,0x06,0x3E,0x41,0x51,0x21,0x5E,0x7F,0x09,0x19,0x29,0x46,
+  0x46,0x49,0x49,0x49,0x31,0x01,0x01,0x7F,0x01,0x01,0x3F,0x40,0x40,0x40,0x3F,
+  0x1F,0x20,0x40,0x20,0x1F,0x3F,0x40,0x38,0x40,0x3F,0x63,0x14,0x08,0x14,0x63,
+  0x07,0x08,0x70,0x08,0x07,0x61,0x51,0x49,0x45,0x43,0x00,0x7F,0x41,0x41,0x00,
+  0x02,0x04,0x08,0x10,0x20,0x00,0x41,0x41,0x7F,0x00,0x04,0x02,0x01,0x02,0x04,
+  0x40,0x40,0x40,0x40,0x40,0x00,0x01,0x02,0x04,0x00,0x20,0x54,0x54,0x54,0x78,
+  0x7F,0x48,0x44,0x44,0x38,0x38,0x44,0x44,0x44,0x20,0x38,0x44,0x44,0x48,0x7F,
+  0x38,0x54,0x54,0x54,0x18,0x08,0x7E,0x09,0x01,0x02,0x0C,0x52,0x52,0x52,0x3E,
+  0x7F,0x08,0x04,0x04,0x78,0x00,0x44,0x7D,0x40,0x00,0x20,0x40,0x44,0x3D,0x00,
+  0x7F,0x10,0x28,0x44,0x00,0x00,0x41,0x7F,0x40,0x00,0x7C,0x04,0x18,0x04,0x78,
+  0x7C,0x08,0x04,0x04,0x78,0x38,0x44,0x44,0x44,0x38,0x7C,0x14,0x14,0x14,0x08,
+  0x08,0x14,0x14,0x18,0x7C,0x7C,0x08,0x04,0x04,0x08,0x48,0x54,0x54,0x54,0x20,
+  0x04,0x3F,0x44,0x40,0x20,0x3C,0x40,0x40,0x20,0x7C,0x1C,0x20,0x40,0x20,0x1C,
+  0x3C,0x40,0x30,0x40,0x3C,0x44,0x28,0x10,0x28,0x44,0x0C,0x50,0x50,0x50,0x3C,
+  0x44,0x64,0x54,0x4C,0x44,0x00,0x08,0x36,0x41,0x00,0x00,0x00,0x7F,0x00,0x00,
+  0x00,0x41,0x36,0x08,0x00,0x10,0x08,0x08,0x10,0x08,0x78,0x46,0x41,0x46,0x78
+};
+
+void ssd_drawChar(int col,int page,char c){
+  if(c<32||c>127) c='?';
+  int idx=(c-32)*5;
+  for(int x=0;x<5;x++){
+    if(col+x>=0&&col+x<128&&page>=0&&page<8)
+      ssd_buf[page*128+(col+x)] = font5x7[idx+x];
+  }
+  if(col+5>=0&&col+5<128&&page>=0&&page<8) ssd_buf[page*128+(col+5)]=0x00;
+}
+
+void ssd_printStr(int x,int page,const char *s){
+  int cx=x;
+  while(*s && cx<122){ ssd_drawChar(cx,page,*s++); cx+=6; }
+}
+
+// Improved display functions with minimal updates
+void showSplash(){
+  ssd_clearBuffer();
+  ssd_printStr(8,2,"Techno MCU");
+  ssd_printStr(8,4,"Raktim Hazra");
+  ssd_displayBuffer();
+}
+
+void updateOLED_full(){
+  static int lastX = -1, lastY = -1;
+  static bool lastRelay = false;
+  static OperationMode lastMode = MODE_MANUAL;
+  
+  // Only update if something changed
+  if(servoXpos == lastX && servoYpos == lastY && 
+     relayState == lastRelay && operationMode == lastMode) {
+    return;
+  }
+  
+  ssd_clearBuffer();
+  char buf[16];
+  
+  ssd_printStr(0,0,"Techno MCU");
+  
+  // Show current mode with icons
+  switch(operationMode){
+    case MODE_MANUAL:
+      ssd_printStr(70,0,"MAN");
+      break;
+    case MODE_SHARPY:
+      ssd_printStr(70,0,"SHP");
+      break;
+    case MODE_RELAY:
+      ssd_printStr(70,0,"RLY");
+      break;
+  }
+  
+  // Servo positions with progress bars
+  ssd_printStr(0,2,"X");
+  snprintf(buf,sizeof(buf),"%3d",servoXpos); 
+  ssd_printStr(12,2,buf);
+  // Simple progress bar for X
+  int barX = map(servoXpos, 0, 180, 0, 40);
+  for(int i=0; i<barX; i++) {
+    if(40+i < 128) ssd_buf[2*128 + 40 + i] = 0xFF;
+  }
+  
+  ssd_printStr(0,3,"Y");
+  snprintf(buf,sizeof(buf),"%3d",servoYpos); 
+  ssd_printStr(12,3,buf);
+  // Simple progress bar for Y
+  int barY = map(servoYpos, 0, 180, 0, 40);
+  for(int i=0; i<barY; i++) {
+    if(40+i < 128) ssd_buf[3*128 + 40 + i] = 0xFF;
+  }
+  
+  // Relay status with icon
+  ssd_printStr(0,5,"R:");
+  ssd_printStr(12,5,relayState?"ON ":"OFF");
+  
+  // Mode quick info
+  ssd_printStr(50,5,"M:");
+  switch(operationMode){
+    case MODE_MANUAL: ssd_printStr(62,5,"MAN"); break;
+    case MODE_SHARPY: ssd_printStr(62,5,"SHP"); break;
+    case MODE_RELAY: ssd_printStr(62,5,"RLY"); break;
+  }
+  
+  // Quick controls hint
+  ssd_printStr(0,7,"A:X B:Y AB:Mode");
+  
+  ssd_displayBuffer();
+  
+  // Store current values
+  lastX = servoXpos;
+  lastY = servoYpos;
+  lastRelay = relayState;
+  lastMode = operationMode;
+}
+
+void updateOLED_manual(){
+  static int lastX = -1, lastY = -1;
+  
+  // Only update if positions changed
+  if(servoXpos == lastX && servoYpos == lastY) {
+    return;
+  }
+  
+  ssd_clearBuffer();
+  char buf[16];
+  
+  ssd_printStr(0,0,"MANUAL CONTROL");
+  ssd_printStr(0,1,"==============");
+  
+  // Large servo display
+  ssd_printStr(0,3,"X:");
+  snprintf(buf,sizeof(buf),"%3d",servoXpos); 
+  ssd_printStr(18,3,buf);
+  
+  ssd_printStr(70,3,"Y:");
+  snprintf(buf,sizeof(buf),"%3d",servoYpos); 
+  ssd_printStr(88,3,buf);
+  
+  // Visual position indicator
+  int xPos = map(servoXpos, 0, 180, 0, 110);
+  int yPos = map(servoYpos, 0, 180, 0, 20);
+  
+  // Draw crosshair
+  for(int i=0; i<120; i++) {
+    if(i == xPos) {
+      for(int j=0; j<24; j++) {
+        if(5+j < 8) ssd_buf[(5+j)*128 + 4 + i] |= 0x18;
+      }
+    }
+  }
+  for(int j=0; j<24; j++) {
+    if(j == yPos) {
+      for(int i=0; i<120; i++) {
+        if(5+j < 8) ssd_buf[(5+j)*128 + 4 + i] |= 0x18;
+      }
+    }
+  }
+  
+  ssd_printStr(0,7,"A:+X  B:+Y");
+  
+  ssd_displayBuffer();
+  lastX = servoXpos;
+  lastY = servoYpos;
+}
+
+void updateOLED_sharpy(){
+  static int patternPhase = -1;
+  static unsigned long lastPatternChange = 0;
+  
+  unsigned long now = millis();
+  int currentPhase = (now / 500) % 4;
+  
+  // Only update if pattern changed
+  if(currentPhase == patternPhase && now - lastOledUpdate < 1000) {
+    return;
+  }
+  
+  ssd_clearBuffer();
+  
+  ssd_printStr(0,0,"SHARPY MODE");
+  ssd_printStr(0,1,"===========");
+  
+  // Pattern visualization
+  const char* patterns[] = {"TOP-LEFT", "TOP-RIGHT", "BOT-RIGHT", "BOT-LEFT"};
+  ssd_printStr(0,3,"Pattern:");
+  ssd_printStr(54,3,patterns[currentPhase]);
+  
+  // Animated pattern display
+  int centerX = 64, centerY = 32;
+  int radius = 20;
+  
+  // Draw circle
+  for(int angle=0; angle<360; angle+=10) {
+    int x = centerX + radius * cos(angle * 3.14159 / 180) / 20;
+    int y = 3 + radius * sin(angle * 3.14159 / 180) / 20;
+    if(x>=0 && x<128 && y>=0 && y<8) {
+      ssd_buf[y*128 + x] |= 0x01 << (angle/45 % 8);
+    }
+  }
+  
+  // Draw current pattern position
+  int targetX, targetY;
+  switch(currentPhase) {
+    case 0: targetX = centerX-15; targetY = 3-5; break;
+    case 1: targetX = centerX+15; targetY = 3-5; break;
+    case 2: targetX = centerX+15; targetY = 3+5; break;
+    case 3: targetX = centerX-15; targetY = 3+5; break;
+  }
+  
+  // Draw target
+  for(int i=-2; i<=2; i++) {
+    for(int j=-1; j<=1; j++) {
+      if(targetX+i >=0 && targetX+i <128 && 3+targetY+j >=0 && 3+targetY+j <8) {
+        ssd_buf[(3+targetY+j)*128 + targetX+i] = 0xFF;
+      }
+    }
+  }
+  
+  ssd_printStr(0,6,"X:");
+  char buf[16];
+  snprintf(buf,sizeof(buf),"%3d",servoXpos); 
+  ssd_printStr(12,6,buf);
+  
+  ssd_printStr(50,6,"Y:");
+  snprintf(buf,sizeof(buf),"%3d",servoYpos); 
+  ssd_printStr(62,6,buf);
+  
+  ssd_printStr(0,7,"Auto:500ms");
+  
+  ssd_displayBuffer();
+  patternPhase = currentPhase;
+  lastPatternChange = now;
+}
+
+void updateOLED_relay(){
+  static bool lastRelay = false;
+  static bool lastS1 = false, lastS2 = false;
+  
+  // Only update if state changed
+  if(relayState == lastRelay && switch1State == lastS1 && switch2State == lastS2) {
+    return;
+  }
+  
+  ssd_clearBuffer();
+  
+  ssd_printStr(0,0,"RELAY CONTROL");
+  ssd_printStr(0,1,"=============");
+  
+  // Large relay status
+  ssd_printStr(20,3,"RELAY:");
+  ssd_printStr(68,3,relayState?"[ON] ":"[OFF]");
+  
+  // Switch status with icons
+  ssd_printStr(0,5,"SW1:");
+  ssd_printStr(24,5,switch1State?"[ON] ":"[OFF]");
+  
+  ssd_printStr(70,5,"SW2:");
+  ssd_printStr(94,5,switch2State?"[ON] ":"[OFF]");
+  
+  // Visual indicator
+  if(relayState) {
+    // Draw filled rectangle for ON
+    for(int i=20; i<40; i++) {
+      for(int j=4; j<6; j++) {
+        if(i<128 && j<8) ssd_buf[j*128 + i] = 0xFF;
+      }
+    }
+  } else {
+    // Draw outline for OFF
+    for(int i=20; i<40; i++) {
+      if(i<128 && 4<8) ssd_buf[4*128 + i] = 0x81;
+      if(i<128 && 5<8) ssd_buf[5*128 + i] = 0x81;
+    }
+    if(20<128 && 4<8) ssd_buf[4*128 + 20] = 0xFF;
+    if(20<128 && 5<8) ssd_buf[5*128 + 20] = 0xFF;
+    if(39<128 && 4<8) ssd_buf[4*128 + 39] = 0xFF;
+    if(39<128 && 5<8) ssd_buf[5*128 + 39] = 0xFF;
+  }
+  
+  ssd_printStr(0,7,"Web:Toggle Relay");
+  
+  ssd_displayBuffer();
+  lastRelay = relayState;
+  lastS1 = switch1State;
+  lastS2 = switch2State;
+}
+
+void updateOLED(){
+  unsigned long now = millis();
+  
+  // Don't update OLED too frequently to maintain servo performance
+  if(now - lastOledUpdate < oledInterval) {
+    return;
+  }
+  
+  lastOledUpdate = now;
+  
+  switch(displayMode){
+    case DISPLAY_FULL:
+      updateOLED_full();
+      break;
+    case DISPLAY_MANUAL:
+      updateOLED_manual();
+      break;
+    case DISPLAY_SHARPY:
+      updateOLED_sharpy();
+      break;
+    case DISPLAY_RELAY:
+      updateOLED_relay();
+      break;
+    default:
+      updateOLED_full();
+      break;
+  }
+}
+
+// Output control - optimized for immediate response
+void applyRelay(){ 
+  digitalWrite(RELAY_PIN, relayState ? LOW : HIGH); 
+}
+
+void applyServos(){ 
+  sX.write(servoXpos); 
+  sY.write(servoYpos); 
+}
+
+// Mode management
+void setOperationMode(OperationMode newMode){
+  operationMode = newMode;
+  
+  // Reset servos to center when changing to manual mode
+  if(newMode == MODE_MANUAL){
+    servoXpos = 90;
+    servoYpos = 90;
+    applyServos();
+  }
+  
+  // Set display mode based on operation mode
+  switch(newMode){
+    case MODE_MANUAL:
+      displayMode = DISPLAY_MANUAL;
+      break;
+    case MODE_SHARPY:
+      displayMode = DISPLAY_SHARPY;
+      break;
+    case MODE_RELAY:
+      displayMode = DISPLAY_RELAY;
+      break;
+  }
+  
+  saveState();
+}
+
+// Switch handling
+void readSwitches(){
+  unsigned long now = millis();
+  if(now - lastSwitchRead < SWITCH_DEBOUNCE) return;
+  
+  lastSwitchRead = now;
+  
+  bool s1 = digitalRead(SWITCH1_PIN) == LOW;
+  bool s2 = digitalRead(SWITCH2_PIN) == LOW;
+  
+  // Detect switch changes
+  if(s1 != lastSwitch1State){
+    lastSwitch1State = s1;
+    if(s1){
+      displayMode = (DisplayMode)((displayMode + 1) % 4);
+    }
+  }
+  
+  if(s2 != lastSwitch2State){
+    lastSwitch2State = s2;
+    if(s2){
+      OperationMode nextMode = (OperationMode)((operationMode + 1) % 3);
+      setOperationMode(nextMode);
+    }
+  }
+}
+
+// Button handling - optimized for immediate response
+void handleButtons(){
+  bool btnA = digitalRead(BTN_A_PIN) == LOW;
+  bool btnB = digitalRead(BTN_B_PIN) == LOW;
+  
+  if(btnA && !btnAPressed){
+    btnAPressed = true;
+    if(operationMode == MODE_MANUAL){
+      servoXpos = constrain(servoXpos + 10, 0, 180);
+      applyServos();
+      saveState();
+    }
+  }
+  if(!btnA && btnAPressed){
+    btnAPressed = false;
+  }
+  
+  if(btnB && !btnBPressed){
+    btnBPressed = true;
+    if(operationMode == MODE_MANUAL){
+      servoYpos = constrain(servoYpos + 10, 0, 180);
+      applyServos();
+      saveState();
+    }
+  }
+  if(!btnB && btnBPressed){
+    btnBPressed = false;
+  }
+  
+  // Both buttons for mode change
+  if(btnA && btnB && !bothButtonsPressed){
+    bothButtonsPressed = true;
+    bothButtonsStartTime = millis();
+  }
+  
+  if(bothButtonsPressed && (btnA && btnB)){
+    if(millis() - bothButtonsStartTime > 1000){
+      OperationMode nextMode = (OperationMode)((operationMode + 1) % 3);
+      setOperationMode(nextMode);
+      bothButtonsPressed = false;
+    }
+  }
+  
+  if(!(btnA && btnB) && bothButtonsPressed){
+    bothButtonsPressed = false;
+  }
+}
+
+// Sharpy mode pattern
+void updateSharpyMode(){
+  static unsigned long lastSharpyUpdate = 0;
+  static int sharpyPattern = 0;
+  
+  if(operationMode != MODE_SHARPY) return;
+  
+  unsigned long now = millis();
+  if(now - lastSharpyUpdate < 500) return;
+  
+  lastSharpyUpdate = now;
+  
+  switch(sharpyPattern){
+    case 0: servoXpos = 45; servoYpos = 45; break;
+    case 1: servoXpos = 135; servoYpos = 45; break;
+    case 2: servoXpos = 135; servoYpos = 135; break;
+    case 3: servoXpos = 45; servoYpos = 135; break;
+  }
+  
+  sharpyPattern = (sharpyPattern + 1) % 4;
+  applyServos();
+}
+
+// EEPROM functions
+void saveState(){
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.write(ADDR_MAGIC, MAGIC);
+  EEPROM.write(ADDR_RELAY, relayState ? 1 : 0);
+  EEPROM.write(ADDR_SERVO_X, constrain(servoXpos, 0, 180));
+  EEPROM.write(ADDR_SERVO_Y, constrain(servoYpos, 0, 180));
+  EEPROM.write(ADDR_MODE, operationMode);
+  EEPROM.commit();
+  EEPROM.end();
+}
+
+void loadState(){
+  EEPROM.begin(EEPROM_SIZE);
+  if(EEPROM.read(ADDR_MAGIC) == MAGIC){
+    relayState = EEPROM.read(ADDR_RELAY) == 1;
+    servoXpos = EEPROM.read(ADDR_SERVO_X);
+    servoYpos = EEPROM.read(ADDR_SERVO_Y);
+    operationMode = (OperationMode)EEPROM.read(ADDR_MODE);
+    
+    // Validate loaded values
+    if(servoXpos < 0 || servoXpos > 180) servoXpos = 90;
+    if(servoYpos < 0 || servoYpos > 180) servoYpos = 90;
+    if(operationMode < MODE_MANUAL || operationMode > MODE_RELAY) {
+      operationMode = MODE_MANUAL;
+    }
+  } else {
+    relayState = false; 
+    servoXpos = 90; 
+    servoYpos = 90; 
+    operationMode = MODE_MANUAL;
+    EEPROM.write(ADDR_MAGIC, MAGIC);
+    EEPROM.commit();
+  }
+  EEPROM.end();
+}
+
+// Captive portal detection
+bool isCaptivePortal(){
+  String host = server.hostHeader();
+  return host != String(apIP.toString()) && host != "" && host != "192.168.4.1";
+}
+
+// Web interface - FIXED VERSION
+String webpage(){
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>TechnoMCU Control</title>";
+  html += "<style>";
+  html += "body{margin:0;background:#0a0a0a;color:#0ff;font-family:Arial,sans-serif;text-align:center}";
+  html += ".top{padding:15px;background:#002a3a;box-shadow:0 4px 20px rgba(0,255,255,0.1)}";
+  html += ".box{padding:15px;margin:10px;border-radius:10px;background:rgba(0,40,60,0.3);border:1px solid rgba(0,255,255,0.1);display:inline-block;vertical-align:top}";
+  html += "#joy{background:#001a22;border-radius:12px;border:2px solid #0ff;cursor:pointer}";
+  html += ".slider{width:90%;height:25px;background:#001a22;border-radius:12px;outline:none;opacity:0.7}";
+  html += ".btn{padding:10px 15px;margin:5px;border-radius:8px;border:none;background:#00ccff;color:#000;font-weight:700;cursor:pointer;font-size:14px}";
+  html += ".ghost{background:transparent;border:2px solid #00ccff;color:#00ccff}";
+  html += ".small{font-size:12px;color:#8af}";
+  html += "#status{font-size:14px;margin-top:10px;color:#8af;padding:8px;background:rgba(0,50,80,0.3);border-radius:8px}";
+  html += ".mode-active{background:#00ff88}";
+  html += "h2{text-shadow:0 0 10px rgba(0,255,255,0.5)}";
+  html += "</style></head><body>";
+  
+  html += "<div class='top'><h2>Techno MCU Control Panel</h2>";
+  html += "<div class='small'>By Raktim Hazra | Captive Portal Active</div></div>";
+  
+  html += "<div class='box'><canvas id='joy' width='200' height='200'></canvas>";
+  html += "<div class='small'>Drag to control servos</div></div>";
+  
+  html += "<div class='box' style='width:300px;text-align:left'>";
+  
+  html += "<div style='margin-bottom:10px'><strong>Mode Control:</strong></div>";
+  html += "<button id='modeManual' class='btn ";
+  html += (operationMode==MODE_MANUAL?"mode-active":"");
+  html += "'>MANUAL</button>";
+  html += "<button id='modeSharpy' class='btn ";
+  html += (operationMode==MODE_SHARPY?"mode-active":"");
+  html += "'>SHARPY</button>";
+  html += "<button id='modeRelay' class='btn ";
+  html += (operationMode==MODE_RELAY?"mode-active":"");
+  html += "'>RELAY</button>";
+  
+  html += "<div style='margin-top:15px'><strong>Servo Control:</strong></div>";
+  html += "<div>X: <span id='sxv'>";
+  html += String(servoXpos);
+  html += "</span>°</div>";
+  html += "<input id='sx' class='slider' type='range' min='0' max='180' value='";
+  html += String(servoXpos);
+  html += "'><br>";
+  html += "<div>Y: <span id='syv'>";
+  html += String(servoYpos);
+  html += "</span>°</div>";
+  html += "<input id='sy' class='slider' type='range' min='0' max='180' value='";
+  html += String(servoYpos);
+  html += "'><br>";
+  
+  html += "<div style='margin-top:10px'>";
+  html += "<button id='stepL' class='btn ghost'>X-5</button>";
+  html += "<button id='stepR' class='btn ghost'>X+5</button>";
+  html += "<button id='stepU' class='btn ghost'>Y+5</button>";
+  html += "<button id='stepD' class='btn ghost'>Y-5</button>";
+  html += "</div>";
+  
+  html += "<div style='margin-top:15px'><strong>Relay Control:</strong></div>";
+  html += "<button id='relayBtn' class='btn ";
+  html += (relayState?"mode-active":"");
+  html += "'>";
+  html += (relayState?"RELAY ON":"RELAY OFF");
+  html += "</button>";
+  
+  html += "<div id='status' class='small'>";
+  html += "Mode: ";
+  if(operationMode == MODE_MANUAL) html += "MANUAL";
+  else if(operationMode == MODE_SHARPY) html += "SHARPY";
+  else html += "RELAY";
+  html += " | X:";
+  html += String(servoXpos);
+  html += " Y:";
+  html += String(servoYpos);
+  html += " | Relay:";
+  html += (relayState?"ON":"OFF");
+  html += "</div></div>";
+  
+  // JavaScript - Fixed concatenation
+  html += "<script>";
+  html += "let joy=document.getElementById('joy'),ctx=joy.getContext('2d'),dragging=false;";
+  html += "let sx=document.getElementById('sx'),sy=document.getElementById('sy'),sxv=document.getElementById('sxv'),syv=document.getElementById('syv');";
+  html += "let lastSend=0;";
+  
+  html += "function drawJoy(x,y){";
+  html += "ctx.clearRect(0,0,200,200);";
+  html += "ctx.fillStyle='#002a3a';ctx.fillRect(0,0,200,200);";
+  html += "ctx.strokeStyle='#00ccff';ctx.lineWidth=2;ctx.strokeRect(10,10,180,180);";
+  html += "ctx.fillStyle='#00ccff';ctx.beginPath();ctx.arc(100+x,100+y,15,0,Math.PI*2);ctx.fill();";
+  html += "}";
+  
+  html += "function updateServos(x,y){";
+  html += "let now=Date.now();";
+  html += "if(now-lastSend>50){";
+  html += "fetch('/move?x='+x+'&y='+y).then(r=>r.text()).then(updateStatus);";
+  html += "lastSend=now;";
+  html += "}";
+  html += "sx.value=x;sxv.textContent=x;";
+  html += "sy.value=y;syv.textContent=y;";
+  html += "}";
+  
+  html += "function updateStatus(){";
+  html += "fetch('/status').then(r=>r.json()).then(data=>{";
+  html += "document.getElementById('status').innerHTML='Mode: '+(data.mode==0?'MANUAL':(data.mode==1?'SHARPY':'RELAY'))+' | X:'+data.x+' Y:'+data.y+' Relay:'+(data.relay?'ON':'OFF');";
+  html += "});";
+  html += "}";
+  
+  html += "joy.addEventListener('mousedown',e=>{dragging=true;handleJoy(e);});";
+  html += "joy.addEventListener('mousemove',e=>{if(dragging)handleJoy(e);});";
+  html += "joy.addEventListener('mouseup',()=>{dragging=false;drawJoy(0,0);updateServos(90,90);});";
+  html += "joy.addEventListener('touchstart',e=>{e.preventDefault();dragging=true;handleJoy(e.touches[0]);});";
+  html += "joy.addEventListener('touchmove',e=>{e.preventDefault();if(dragging)handleJoy(e.touches[0]);});";
+  html += "joy.addEventListener('touchend',()=>{dragging=false;drawJoy(0,0);updateServos(90,90);});";
+  
+  html += "function handleJoy(e){";
+  html += "let rect=joy.getBoundingClientRect();";
+  html += "let x=((e.clientX-rect.left-100)/80)*90+90;";
+  html += "let y=((e.clientY-rect.top-100)/80)*90+90;";
+  html += "x=Math.max(0,Math.min(180,x));y=Math.max(0,Math.min(180,y));";
+  html += "drawJoy((x-90)/90*80,(y-90)/90*80);";
+  html += "updateServos(Math.round(x),Math.round(y));";
+  html += "}";
+  
+  html += "sx.oninput=()=>{updateServos(sx.value,sy.value);};";
+  html += "sy.oninput=()=>{updateServos(sx.value,sy.value);};";
+  
+  html += "document.getElementById('stepL').onclick=()=>updateServos(parseInt(sx.value)-5,parseInt(sy.value));";
+  html += "document.getElementById('stepR').onclick=()=>updateServos(parseInt(sx.value)+5,parseInt(sy.value));";
+  html += "document.getElementById('stepU').onclick=()=>updateServos(parseInt(sx.value),parseInt(sy.value)+5);";
+  html += "document.getElementById('stepD').onclick=()=>updateServos(parseInt(sx.value),parseInt(sy.value)-5);";
+  
+  html += "document.getElementById('relayBtn').onclick=()=>{";
+  html += "fetch('/relay').then(r=>r.text()).then(t=>{";
+  html += "document.getElementById('relayBtn').textContent=t=='ON'?'RELAY ON':'RELAY OFF';";
+  html += "document.getElementById('relayBtn').className=t=='ON'?'btn mode-active':'btn';";
+  html += "updateStatus();";
+  html += "});";
+  html += "};";
+  
+  html += "document.getElementById('modeManual').onclick=()=>{fetch('/setmode?mode=0').then(()=>location.reload());};";
+  html += "document.getElementById('modeSharpy').onclick=()=>{fetch('/setmode?mode=1').then(()=>location.reload());};";
+  html += "document.getElementById('modeRelay').onclick=()=>{fetch('/setmode?mode=2').then(()=>location.reload());};";
+  
+  html += "drawJoy(0,0);";
+  html += "setInterval(updateStatus,1500);";
+  html += "</script>";
+  
+  html += "</body></html>";
+  return html;
+}
+
+// Setup
+void setup(){
+  // Initialize pins
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BTN_A_PIN, INPUT_PULLUP);
+  pinMode(BTN_B_PIN, INPUT_PULLUP);
+  pinMode(SWITCH1_PIN, INPUT_PULLUP);
+  pinMode(SWITCH2_PIN, INPUT_PULLUP);
+  
+  // Initialize OLED
+  ssd_init();
+  showSplash();
+  
+  // Load saved state
+  loadState();
+  
+  // Initialize servos and relay
+  sX.attach(SERVO_X_PIN); 
+  sY.attach(SERVO_Y_PIN);
+  applyServos(); 
+  applyRelay();
+
+  // Setup WiFi AP
+  WiFi.softAP(apSsid, apPass);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
+  dnsServer.start(53, "*", apIP);
+
+  // Setup web server routes
+  server.on("/", [](){ 
+    if(isCaptivePortal()){
+      server.sendHeader("Location", String("http://") + apIP.toString(), true);
+      server.send(302, "text/plain", "");
+    } else {
+      server.send(200, "text/html", webpage()); 
+    }
+  });
+  
+  server.on("/move", [](){ 
+    if(server.hasArg("x")) servoXpos = server.arg("x").toInt();
+    if(server.hasArg("y")) servoYpos = server.arg("y").toInt();
+    applyServos();
+    saveState();
+    server.send(200, "text/plain", "OK");
+  });
+  
+  server.on("/relay", [](){ 
+    relayState = !relayState; 
+    applyRelay(); 
+    saveState(); 
+    server.send(200, "text/plain", relayState ? "ON" : "OFF"); 
+  });
+  
+  server.on("/setmode", [](){ 
+    if(server.hasArg("mode")){
+      int mode = server.arg("mode").toInt();
+      if(mode >= 0 && mode <= 2){
+        setOperationMode((OperationMode)mode);
+      }
+    }
+    server.send(200, "text/plain", "OK"); 
+  });
+  
+  server.on("/status", [](){ 
+    String json = "{";
+    json += "\"x\":" + String(servoXpos) + ",";
+    json += "\"y\":" + String(servoYpos) + ",";
+    json += "\"relay\":" + String(relayState ? 1 : 0) + ",";
+    json += "\"mode\":" + String(operationMode);
+    json += "}";
+    server.send(200, "application/json", json); 
+  });
+  
+  server.onNotFound([](){
+    if(isCaptivePortal()){
+      server.sendHeader("Location", String("http://") + apIP.toString(), true);
+      server.send(302, "text/plain", "");
+    } else {
+      server.send(404, "text/plain", "Not Found");
+    }
+  });
+  
+  server.begin();
+}
+
+// Main loop - optimized for servo performance
+void loop(){
+  // Handle network requests (non-blocking)
+  dnsServer.processNextRequest();
+  server.handleClient();
+  
+  // Handle inputs
+  handleButtons();
+  readSwitches();
+  
+  // Update sharpy pattern if active
+  updateSharpyMode();
+  
+  // Update OLED display (limited frequency)
+  updateOLED();
+}
